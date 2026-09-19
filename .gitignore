@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.obj
+*.exe
+*.pdb
+*.spec
+build/
+bin/
+cache/
+exports/
+settings.json

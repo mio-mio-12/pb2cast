@@ -1,0 +1,6 @@
+studio_i3.py is copied from the supplied PointBlankAGRandTools release agrtool/i3.py.
+studio_metadata.py is adapted from its i3pack_studio/script_metadata.py, changing imports
+for standalone operation. These are bundled locally so the supplied tools do not need
+to be installed alongside pb2cast. Their original module documentation is preserved.
+
+animation_source.py adapts the APF format reader from the supplied PointBlankAGRandTools agrtool/i3anim.py. It uses consistent continuous key lookup, retains source channel semantics, and does not import the reference tool's cinematic visibility-scale policy.
