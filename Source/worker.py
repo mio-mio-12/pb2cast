@@ -11,8 +11,8 @@ from studio_metadata import load_weapon_metadata_index
 from animation_source import decode_pack, DECODER_REV, sample_count, load_i3animpack
 
 VERSION = 9
-PIPELINE_REV = 11
-MODEL_REV = 2
+PIPELINE_REV = 12
+MODEL_REV = 3
 HOME = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).parent
 INDEX_HOME=(HOME/'../../cache/index').resolve() if getattr(sys,'frozen',False) else HOME/'index-cache'
 def persistent_index(kind,stamp,build):
@@ -103,7 +103,7 @@ def shared_asset(root,ref,cache):
     return None
 
 def read_character(data,name,assets,root,cache,arms=False,player=False):
-    key=hashlib.sha256(str((VERSION,MODEL_REV)).encode()+str(root).encode()+data+str(player).encode()).hexdigest()
+    key=hashlib.sha256(str((VERSION,MODEL_REV)).encode()+str(root).encode()+data+str((arms,player)).encode()).hexdigest()
     shared=INDEX_HOME/'characters'/key;file=shared/'model.json';shared.mkdir(parents=True,exist_ok=True)
     if file.exists():model=json.loads(file.read_text())
     else:
@@ -115,6 +115,56 @@ def read_character(data,name,assets,root,cache,arms=False,player=False):
                 source=shared/(texture+suffix);target=cache/(texture+suffix)
                 if source.exists() and not target.exists():shutil.copyfile(source,target)
     return model
+
+def remap_draw_skin(ga, blocks_by_id, indices, positions, normals, uvs, ids, weights, bone_count):
+    # SGA1 stores draw-local palettes: each 32-byte record has a start index,
+    # triangle count, palette length and twenty byte-sized skeleton indices.
+    # The memory-buffer reference belongs to this geometry, not a nearby LOD.
+    offset=25 if ga[:4]==b'GEO2' else 21
+    if ga[offset:offset+4]!=b'SGA1':
+        return indices,positions,normals,uvs,ids,weights
+    section_count=u(ga,offset+4);buffer_id=u(ga,offset+8)
+    kind,data=blocks_by_id[buffer_id]
+    if kind!='i3MemoryBuffer' or len(data)!=4+section_count*32 or u(data,0)!=section_count*32:
+        raise ValueError('Invalid draw skin palette buffer')
+    covered=np.zeros(len(indices),dtype=bool);out_indices=np.empty(len(indices),dtype=int)
+    vertices=[];out_ids=[];out_weights=[]
+    for section in range(section_count):
+        off=4+section*32;start=u(data,off);end=start+u(data,off+4)*3;n=u(data,off+8)
+        if not 1<=n<=20 or start%3 or end>len(indices) or covered[start:end].any():
+            raise ValueError('Invalid draw skin range')
+        palette=np.frombuffer(data,dtype=np.uint8,count=n,offset=off+12).astype(int)
+        if np.any(palette>=bone_count):raise ValueError('Draw skin palette exceeds skeleton')
+        source,reverse=np.unique(np.asarray(indices[start:end]),return_inverse=True)
+        local=ids[source].copy();active=weights[source]>0
+        if np.any(local[active]>=n):raise ValueError('Vertex influence exceeds draw palette')
+        local[~active]=0;mapped=palette[local];mapped[~active]=0
+        out_indices[start:end]=reverse+len(vertices)
+        vertices.extend(source.tolist());out_ids.extend(mapped);out_weights.extend(weights[source])
+        covered[start:end]=True
+    if not covered.all():raise ValueError('Draw skin ranges do not cover triangles')
+    # Only referenced vertices belong to the draw. Shared source buffers may
+    # also contain body geometry, or reuse a vertex under another palette.
+    return out_indices.tolist(),positions[vertices],normals[vertices],uvs[vertices],np.asarray(out_ids),np.asarray(out_weights)
+
+
+def validate_viewhands(model):
+    bones=model['bones']
+    def descendants(name):
+        found={i for i,b in enumerate(bones) if b['name']==name}
+        for i,b in enumerate(bones):
+            if b['parent'] in found:found.add(i)
+        return found
+    coverage={}
+    for side in ('L','R'):
+        chain=descendants(side+' UpperArm');total=0
+        for mesh in model['meshes']:
+            used=np.unique(mesh['indices']);ids=np.asarray(mesh['boneIndices'])[used];weights=np.asarray(mesh['weights'])[used]
+            total+=int(np.any(np.isin(ids,list(chain)) & (weights>0),axis=1).sum())
+        if not total:raise ValueError('Viewhands have no vertices weighted to '+side+' arm')
+        coverage[side]=total
+    model['armVertexCoverage']=coverage
+
 
 def read_model(data, name, assets, root, cache, arms=False, player=False):
     bl=blocks(data); refs=extrefs(data)
@@ -241,9 +291,11 @@ def read_model(data, name, assets, root, cache, arms=False, player=False):
         if not all(np.isfinite(v).all() for v in (pos,norm,uv)):raise ValueError('Non-finite vertex')
         influences=(flag>>14)&15; explicit=(flag>>18)&15
         blended=1<=explicit<=3 and influences==explicit+1
-        if blended:
+        draw_skinned=ga[(25 if off else 21):(29 if off else 25)]==b'SGA1'
+        skinned=blended or (draw_skinned and influences==1 and explicit==0)
+        if skinned:
             if stride<skinOffset+4+explicit*4:raise ValueError('Truncated skin vertex')
-            if not player:
+            if not player and not draw_skinned:
                 palette=next((b for k,b in bl.values() if k=='i3MemoryBuffer' and len(b)==4+count*4),None)
                 if palette is None:raise ValueError('Missing bone palette')
                 paletteIds=list(struct.unpack('<'+'I'*count,palette[4:]))
@@ -257,9 +309,13 @@ def read_model(data, name, assets, root, cache, arms=False, player=False):
         else:
             ids=np.full((nv,1),owner);weights=np.ones((nv,1))
             pos=(worlds[owner]@np.c_[pos,np.ones(nv)].T).T[:,:3];norm=(worlds[owner][:3,:3]@norm.T).T
+        if skinned:
+            indices,pos,norm,uv,ids,weights=remap_draw_skin(ga,bl,indices,pos,norm,uv,ids,weights,count)
         meshes[mn]=dict(name=mn,positions=pos.tolist(),normals=norm.tolist(),uvs=uv.tolist(),indices=indices,boneIndices=ids.tolist(),weights=weights.tolist(),material=mk)
     if not meshes:raise ValueError('No supported meshes found')
-    return dict(name=name,bones=bones,meshes=list(meshes.values()),materials=materials,warnings=sorted(set(warnings)),sockets=sockets)
+    model=dict(name=name,bones=bones,meshes=list(meshes.values()),materials=materials,warnings=sorted(set(warnings)),sockets=sockets)
+    if arms:validate_viewhands(model)
+    return model
 
 def decode(path, root, cache):
     data=path.read_bytes()
@@ -557,7 +613,7 @@ def load(req):
     result=load_uncached(actual)
     scene=result.pop('_scene',None)
     if scene is None:scene=json.loads(Path(result['scene']).read_text())
-    scene['samplingRevision']=DECODER_REV;scene['inputStamp']=stamp;scene['assetId']=req['pack'];scene['assetName']=actual.get('recordKey',Path(req['pack']).stem.removeprefix('Weapon_'));save_json(path,scene)
+    scene['pipelineRevision']=PIPELINE_REV;scene['samplingRevision']=DECODER_REV;scene['inputStamp']=stamp;scene['assetId']=req['pack'];scene['assetName']=actual.get('recordKey',Path(req['pack']).stem.removeprefix('Weapon_'));save_json(path,scene)
     return result
 
 def texture_remaps(root):
@@ -1061,8 +1117,8 @@ def batch_export(req):
 
 def export(req,scene=None):
     if scene is None:scene=json.loads(Path(req['scene']).read_text())
-    if scene.get('samplingRevision') != DECODER_REV:
-        raise ValueError('This scene uses an older animation decoder. Click Load assets before exporting again.')
+    if scene.get('samplingRevision') != DECODER_REV or scene.get('pipelineRevision') != PIPELINE_REV:
+        raise ValueError('This scene uses an older exporter. Click Load assets before exporting again.')
     cache=Path(scene['cache']);written=[];weaponStem=export_stem(scene,'weapon') if scene.get('weapon') else None
     if req.get('models',True):
         dest=Path(req['modelDestination']);dest.mkdir(parents=True,exist_ok=True)
