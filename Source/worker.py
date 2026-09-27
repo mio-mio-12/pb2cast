@@ -11,7 +11,7 @@ from studio_metadata import load_weapon_metadata_index
 from animation_source import decode_pack, DECODER_REV, sample_count, load_i3animpack
 
 VERSION = 9
-PIPELINE_REV = 12
+PIPELINE_REV = 13
 MODEL_REV = 3
 HOME = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).parent
 INDEX_HOME=(HOME/'../../cache/index').resolve() if getattr(sys,'frozen',False) else HOME/'index-cache'
@@ -701,11 +701,7 @@ def load_uncached(req):
     actions={}
     chrs=[(n,d) for n,d in assets.items() if n.endswith('.i3chr')]
     chrdata=next((d for n,d in chrs if Path(n).stem==Path(chosen[0]).stem),chrs[0][1] if chrs else None)
-    if chrdata:
-        for kind,b in blocks(chrdata).values():
-            if kind=='i3AIState':
-                resources=re.findall(rb'[A-Za-z0-9_./\\-]+\.i3a',b,re.IGNORECASE)
-                if resources:actions[short(b)[0].lower()]=resources[-1].decode('cp1252')
+    if chrdata:actions=weapon_actions(chrdata)
     wclips=[]
     animationAssets={**baseAssets,**selectedAssets}
     for baseRecord in weapon_records(root):
@@ -841,6 +837,30 @@ def character_clips(root,gender,record,candidates,cache):
     for ap,names in entries:
         if any(n in selected for n in names):result.extend(c for c in decode(ap,root,cache) if c['name'].replace('\\','/') in selected)
     return result
+
+def weapon_actions(data):
+    """Resolve AIS1 animation references before considering legacy inline paths."""
+    root=parse_i3r2(data);by_id={b.block_id:b for b in root.blocks};actions={}
+    for block in root.blocks:
+        if block.type_name!='i3AIState':continue
+        name,offset=short(block.data);payload=block.data[offset:];resource=None
+        if payload[:4]==b'AIS1' and len(payload)>=20:
+            index,tag=struct.unpack_from('<HH',payload,16)
+            if tag==0xffff:
+                # External references directly index the resource string table.
+                if index<len(root.text_lines):resource=root.text_lines[index]
+            else:
+                linked=by_id.get(index)
+                if linked is not None and linked.type_name=='i3Animation':
+                    if tag&0x8000 and tag-0x8000==linked.target and 0<=linked.target<len(root.text_lines):
+                        resource=root.text_lines[linked.target]
+        if resource and resource.lower().endswith('.i3a'):
+            actions[name.lower()]=resource.replace('\\','/')
+        else:
+            resources=re.findall(rb'[A-Za-z0-9_./\\-]+\.i3a',block.data,re.IGNORECASE)
+            if resources:actions[name.lower()]=resources[-1].decode('cp1252')
+    return actions
+
 
 def weapon_companion(stem,clips,actions,gender,side=''):
     half=re.search(r'_(Left|Right)$',stem,re.I)
